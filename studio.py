@@ -21,6 +21,8 @@ from pydantic import BaseModel, Field
 
 LOG = logging.getLogger('clip-studio')
 MAX_DOWNLOAD_BYTES = 3 * 1024**3
+BROWSER_USER_AGENT = ('Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
+                      'AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36')
 LANGUAGES = {'fa': 'فارسی', 'bn': 'বাংলা', 'ar': 'العربية', 'en': 'English'}
 
 
@@ -83,12 +85,23 @@ def is_aparat(url: str) -> bool:
     return (urlparse(url).hostname or '').lower() in ('aparat.com', 'www.aparat.com')
 
 
+def is_aparat_cdn(url: str) -> bool:
+    """Recognize direct Aparat media URLs (distinct from its player page)."""
+    host = (urlparse(url).hostname or '').lower()
+    return host == 'asset.aparat.com' or host.endswith('.asset.aparat.com')
+
+
 def is_google_drive(url: str) -> bool:
     return (urlparse(url).hostname or '').lower() in ('drive.google.com', 'docs.google.com')
 
 
 def fetch_video(url: str, work_dir: Path) -> Path:
-    """Download a video from a URL; private Drive files need a separate connector (not provided)."""
+    """Download a publicly accessible video for which the user has permission.
+
+    Aparat *player pages* use yt-dlp. Direct Aparat CDN URLs use HTTP with a
+    page Referer, but can still expire or block datacenter IPs; in that case a
+    player page URL or an accessible copy in Google Drive is required.
+    """
     if not url.startswith(('https://', 'http://')):
         raise ValueError('VIDEO_URL must start with https:// or http://')
     target = work_dir / 'source.mp4'
@@ -100,8 +113,8 @@ def fetch_video(url: str, work_dir: Path) -> Path:
             raise RuntimeError('Google Drive download failed. Check link access (Anyone with the link).')
     elif is_youtube(url) or is_aparat(url):
         import yt_dlp
-        provider = "Aparat" if is_aparat(url) else "YouTube"
-        LOG.info("Downloading video from %s. Only use content you are entitled to process.", provider)
+        provider = 'Aparat' if is_aparat(url) else 'YouTube'
+        LOG.info('Downloading %s player PAGE using yt-dlp (not direct CDN URL)', provider)
         opts = {
             'format': 'bv*[height<=1080]+ba/b[height<=1080]/b',
             'outtmpl': str(work_dir / 'source.%(ext)s'),
@@ -109,34 +122,79 @@ def fetch_video(url: str, work_dir: Path) -> Path:
             'noplaylist': True,
             'quiet': False,
             'retries': 3,
+            'fragment_retries': 3,
+            'http_headers': {'User-Agent': BROWSER_USER_AGENT,
+                             'Referer': 'https://www.aparat.com/' if is_aparat(url) else 'https://www.youtube.com/'},
         }
-        with yt_dlp.YoutubeDL(opts) as ydl:
-            ydl.download([url])
-        candidates = sorted(work_dir.glob('source.*'), key=lambda p: p.stat().st_size, reverse=True)
+        try:
+            with yt_dlp.YoutubeDL(opts) as ydl:
+                ydl.download([url])
+        except Exception as exc:
+            message = str(exc)
+            if is_aparat(url) and any(word in message.lower() for word in ('403', 'forbidden', 'geo', 'unavailable', 'not available')):
+                raise RuntimeError(
+                    'Aparat player page could not be downloaded from the GitHub runner. '
+                    'The Aparat CDN might restrict GitHub datacenter IPs or your region. '
+                    'Download your authorized video using Aparat in your browser, upload the MP4 to '
+                    'Google Drive with "Anyone with the link" Viewer access, and enter that Drive share URL '
+                    'as video_url. Do not paste caspian*.asset.aparat.com MP4 links.'
+                ) from exc
+            raise RuntimeError(f'{provider} download failed with yt-dlp: {message[-500:]}') from exc
+        candidates = sorted(
+            (p for p in work_dir.glob('source.*') if p.is_file() and p.stat().st_size > 0
+             and not p.suffix in ('.part', '.ytdl')),
+            key=lambda p: p.stat().st_size, reverse=True
+        )
         if not candidates:
-            raise RuntimeError(f'Video not downloaded from {provider}; GitHub-hosted IP may be restricted.')
+            raise RuntimeError(f'Video not downloaded from {provider}. '
+                               'Try a publicly accessible Google Drive MP4 instead.')
         target = candidates[0]
     else:
         import requests
-        LOG.info('Downloading direct video URL')
-        with requests.get(url, stream=True, timeout=(25, 180), allow_redirects=True) as resp:
-            resp.raise_for_status()
-            mime = resp.headers.get('Content-Type', '').lower()
-            if 'text/html' in mime:
-                raise ValueError('This URL returned an HTML page instead of a video; use a direct file URL.')
-            reported = int(resp.headers.get('content-length') or 0)
-            if reported > MAX_DOWNLOAD_BYTES:
-                raise ValueError('Input exceeds 3GB safety limit.')
-            total = 0
-            with target.open('wb') as f:
-                for chunk in resp.iter_content(chunk_size=1024 * 1024):
-                    if not chunk:
-                        continue
-                    total += len(chunk)
-                    if total > MAX_DOWNLOAD_BYTES:
-                        raise ValueError('Input exceeds 3GB safety limit.')
-                    f.write(chunk)
-    if target.stat().st_size == 0 or target.stat().st_size > MAX_DOWNLOAD_BYTES:
+        direct_aparat = is_aparat_cdn(url)
+        if direct_aparat:
+            LOG.warning('Aparat CDN MP4 supplied; prefer https://www.aparat.com/v/VIDEO_ID. '
+                        'Direct media URLs can expire or return HTTP 403 on GitHub.')
+        else:
+            LOG.info('Downloading direct video URL')
+        headers = {'User-Agent': BROWSER_USER_AGENT}
+        if direct_aparat:
+            headers.update({'Referer': 'https://www.aparat.com/',
+                            'Origin': 'https://www.aparat.com'})
+        try:
+            with requests.get(url, stream=True, timeout=(25, 180),
+                              allow_redirects=True, headers=headers) as resp:
+                resp.raise_for_status()
+                mime = resp.headers.get('Content-Type', '').lower()
+                if 'text/html' in mime or 'application/json' in mime:
+                    raise ValueError('This URL returned a webpage/error response instead of video.')
+                reported = int(resp.headers.get('content-length') or 0)
+                if reported > MAX_DOWNLOAD_BYTES:
+                    raise ValueError('Input exceeds 3GB safety limit.')
+                total = 0
+                with target.open('wb') as f:
+                    for chunk in resp.iter_content(chunk_size=1024 * 1024):
+                        if not chunk:
+                            continue
+                        total += len(chunk)
+                        if total > MAX_DOWNLOAD_BYTES:
+                            raise ValueError('Input exceeds 3GB safety limit.')
+                        f.write(chunk)
+        except requests.exceptions.HTTPError as exc:
+            status = getattr(exc.response, 'status_code', None)
+            if status == 403 and direct_aparat:
+                raise RuntimeError(
+                    'Aparat CDN returned HTTP 403 Forbidden. This is an access restriction, '
+                    'not an invalid clip duration. Do NOT use caspian*.asset.aparat.com/*.mp4. '
+                    'Enter the original player page URL, e.g. https://www.aparat.com/v/VIDEO_ID. '
+                    'If that page also fails from GitHub, upload your permitted MP4 to '
+                    'Google Drive and paste its publicly viewable share URL.'
+                ) from exc
+            if status == 403:
+                raise RuntimeError('Direct video server returned HTTP 403. Provide an accessible '
+                                   'video file URL or Google Drive share link instead.') from exc
+            raise
+    if not target.exists() or target.stat().st_size == 0 or target.stat().st_size > MAX_DOWNLOAD_BYTES:
         raise ValueError('Empty or oversized video (limit: 3GB).')
     LOG.info('Downloaded: %.1f MB', target.stat().st_size / 1024**2)
     return target
@@ -510,7 +568,18 @@ def main() -> None:
         '1) dashboard.html را باز کنید.\n2) پوشه clips و metadata را بررسی کنید.\n'
         '3) درستی گفته‌ها، زمان آغاز و پایان، مسائل حق نشر و قوانین یوتیوب را پیش از انتشار کنترل کنید.\n'
         '4) این سامانه ویدئو را در یوتیوب منتشر نمی‌کند.\n', encoding='utf-8')
-    source = fetch_video(url, work_dir)
+    try:
+        source = fetch_video(url, work_dir)
+    except Exception as exc:
+        (out_dir / 'download-error.txt').write_text(
+            'YouTube Clip Studio - download failed\n'
+            f'{type(exc).__name__}: {exc}\n\n'
+            'For Aparat: use the VIDEO PAGE link https://www.aparat.com/v/VIDEO_ID, '
+            'not a caspian*.asset.aparat.com MP4 URL.\n'
+            'If Aparat blocks GitHub, upload the authorized original MP4 '
+            'to Google Drive and use its share URL.\n',
+            encoding='utf-8')
+        raise
     duration = video_duration(source)
     LOG.info('Source duration: %.2f seconds', duration)
     if mode == 'automatic' and duration < min_seconds:
