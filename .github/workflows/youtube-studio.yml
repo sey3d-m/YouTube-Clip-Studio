@@ -7,6 +7,11 @@ on:
         description: 'لینک صفحه آپارات (aparat.com/v/...)، یوتیوب یا Drive؛ لینک CDN آپارات ندهید'
         required: true
         type: string
+      backup_video_url:
+        description: 'اختیاری: لینک فایل پشتیبان Google Drive اگر دانلود آپارات شکست خورد'
+        required: false
+        default: ''
+        type: string
       mode:
         description: 'نوع پردازش'
         required: true
@@ -81,6 +86,7 @@ jobs:
     env:
       GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
       VIDEO_URL: ${{ inputs.video_url }}
+      BACKUP_VIDEO_URL: ${{ inputs.backup_video_url }}
       STUDIO_MODE: ${{ inputs.mode }}
       STUDIO_LANGUAGE: ${{ inputs.language }}
       STUDIO_COUNT: ${{ inputs.count }}
@@ -105,6 +111,9 @@ jobs:
           sudo apt-get install -y -qq ffmpeg fonts-noto-core
           python -m pip install --upgrade pip
           python -m pip install -r requirements.txt
+
+      - name: Self-tests (offline)
+        run: python -m unittest discover -s tests -q
 
       - name: Process source and create clips
         run: python studio.py
