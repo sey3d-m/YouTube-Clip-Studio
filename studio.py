@@ -79,6 +79,10 @@ def is_youtube(url: str) -> bool:
     )
 
 
+def is_aparat(url: str) -> bool:
+    return (urlparse(url).hostname or '').lower() in ('aparat.com', 'www.aparat.com')
+
+
 def is_google_drive(url: str) -> bool:
     return (urlparse(url).hostname or '').lower() in ('drive.google.com', 'docs.google.com')
 
@@ -94,9 +98,10 @@ def fetch_video(url: str, work_dir: Path) -> Path:
         result = gdown.download(url=url, output=str(target), quiet=False, fuzzy=True)
         if not result or not target.exists():
             raise RuntimeError('Google Drive download failed. Check link access (Anyone with the link).')
-    elif is_youtube(url):
+    elif is_youtube(url) or is_aparat(url):
         import yt_dlp
-        LOG.info('Downloading video from YouTube. Only use content you are entitled to process.')
+        provider = "Aparat" if is_aparat(url) else "YouTube"
+        LOG.info("Downloading video from %s. Only use content you are entitled to process.", provider)
         opts = {
             'format': 'bv*[height<=1080]+ba/b[height<=1080]/b',
             'outtmpl': str(work_dir / 'source.%(ext)s'),
@@ -109,7 +114,7 @@ def fetch_video(url: str, work_dir: Path) -> Path:
             ydl.download([url])
         candidates = sorted(work_dir.glob('source.*'), key=lambda p: p.stat().st_size, reverse=True)
         if not candidates:
-            raise RuntimeError('Video not downloaded from YouTube; GitHub-hosted IP may be restricted.')
+            raise RuntimeError(f'Video not downloaded from {provider}; GitHub-hosted IP may be restricted.')
         target = candidates[0]
     else:
         import requests
@@ -431,6 +436,57 @@ def dashboard(out_dir: Path, items: list[dict], summary: str, rejects: list[str]
     (out_dir / 'dashboard.html').write_text(page, encoding='utf-8')
 
 
+
+def parse_number_setting(name: str, default: int) -> int:
+    """Parse GitHub Actions input: seconds, mm:ss or hh:mm:ss, including Persian digits."""
+    raw = os.environ.get(name, '').strip()
+    if not raw:
+        return default
+    try:
+        if name in ('STUDIO_MIN_SECONDS', 'STUDIO_MAX_SECONDS') and ':' in raw:
+            parts = raw.split(':')
+            if len(parts) not in (2, 3) or any(not x.isdecimal() for x in parts):
+                raise ValueError()
+            values = [int(x) for x in parts]
+            if any(v >= 60 for v in values[1:]):
+                raise ValueError()
+            seconds = 0
+            for value in values:
+                seconds = seconds * 60 + value
+            return seconds
+        return int(raw)
+    except ValueError as exc:
+        raise ValueError(
+            f'{name}={raw!r} is invalid. Enter a whole number in seconds such as 25 or 90, '
+            'or a duration such as 1:30.'
+        ) from exc
+
+
+def load_clip_settings(mode: str) -> tuple[int, int, int]:
+    """Validate automatic settings; return (count, min_seconds, max_seconds)."""
+    if mode == 'precut':
+        LOG.info('precut mode: processing whole video; count/min/max are ignored')
+        return 1, 25, 65
+    count = parse_number_setting('STUDIO_COUNT', 4)
+    min_seconds = parse_number_setting('STUDIO_MIN_SECONDS', 25)
+    max_seconds = parse_number_setting('STUDIO_MAX_SECONDS', 65)
+    LOG.info('Clip settings: count=%s, min_seconds=%s, max_seconds=%s',
+             count, min_seconds, max_seconds)
+    if not 1 <= count <= 12:
+        raise ValueError(f'STUDIO_COUNT={count} is outside the supported range 1–12.')
+    if min_seconds > max_seconds:
+        LOG.warning('Minimum length %ss exceeds maximum %ss; swapping automatically.',
+                    min_seconds, max_seconds)
+        min_seconds, max_seconds = max_seconds, min_seconds
+    if not 5 <= min_seconds <= max_seconds <= 900:
+        raise ValueError(
+            f'Invalid duration interval: min_seconds={min_seconds}, max_seconds={max_seconds}. '
+            'Use 5–900 seconds (or mm:ss), e.g. min_seconds=25 max_seconds=65. '
+            'Clips over 180 seconds may not qualify as Shorts.'
+        )
+    return count, min_seconds, max_seconds
+
+
 def main() -> None:
     logging.basicConfig(level=logging.INFO, format='%(asctime)s | %(levelname)s | %(message)s')
     url = os.environ.get('VIDEO_URL', '').strip()
@@ -438,15 +494,11 @@ def main() -> None:
     language = os.environ.get('STUDIO_LANGUAGE', 'fa')
     model = os.environ.get('STUDIO_MODEL', 'gemini-3.8-flash')
     subject = os.environ.get('STUDIO_SUBJECT', '')
-    count = int(os.environ.get('STUDIO_COUNT', '4'))
-    min_seconds = int(os.environ.get('STUDIO_MIN_SECONDS', '25'))
-    max_seconds = int(os.environ.get('STUDIO_MAX_SECONDS', '65'))
+    count, min_seconds, max_seconds = load_clip_settings(mode)
     out_dir = Path(os.environ.get('OUTPUT_DIR', 'output')).resolve()
     work_dir = Path('work').resolve()
     if mode not in ('automatic', 'precut') or language not in LANGUAGES:
         raise ValueError('Unknown mode or language')
-    if not 1 <= count <= 6 or not 8 <= min_seconds <= max_seconds <= 180:
-        raise ValueError('Invalid clip count or length interval')
     if not url:
         raise ValueError('VIDEO_URL input is empty')
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -515,4 +567,6 @@ if __name__ == '__main__':
         main()
     except Exception as error:
         logging.exception('Studio failed: %s', error)
+        message = str(error).replace('%', '%25').replace('\r', '%0D').replace('\n', '%0A')
+        print(f'::error title=YouTube Clip Studio::{message}', flush=True)
         sys.exit(1)
