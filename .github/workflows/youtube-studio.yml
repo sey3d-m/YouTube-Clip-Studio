@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       video_url:
-        description: 'لینک مستقیم ویدئو / Google Drive (Anyone with the link) / YouTube (محتوای مجاز)'
+        description: 'لینک صفحه پخش آپارات/یوتیوب، Google Drive یا فایل مستقیم (ویدئوی مجاز)'
         required: true
         type: string
       mode:
@@ -26,7 +26,7 @@ on:
           - ar
           - en
       count:
-        description: 'حداکثر تعداد کلیپ (در حالت automatic)'
+        description: 'تعداد کلیپ در automatic (۱ تا ۱۲؛ در precut نادیده گرفته می‌شود)'
         required: true
         default: '4'
         type: choice
@@ -37,13 +37,19 @@ on:
           - '4'
           - '5'
           - '6'
+          - '7'
+          - '8'
+          - '9'
+          - '10'
+          - '11'
+          - '12'
       min_seconds:
-        description: 'حداقل طول کلیپ - ثانیه'
+        description: 'حداقل طول کلیپ - ثانیه (یا مثل 1:30؛ از ۵ تا ۹۰۰)'
         required: true
         default: '25'
         type: string
       max_seconds:
-        description: 'حداکثر طول کلیپ - ثانیه'
+        description: 'حداکثر طول کلیپ - ثانیه (یا مثل 1:30؛ از ۵ تا ۹۰۰)'
         required: true
         default: '65'
         type: string
