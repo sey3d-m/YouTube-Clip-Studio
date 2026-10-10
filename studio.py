@@ -45,7 +45,7 @@ class Plan(BaseModel):
 
 
 def run_cmd(command: list[str], *, quiet: bool = False) -> str:
-    LOG.info('Executing: %s', ' '.join(command[:10]))
+    LOG.info('Executing media command: %s', command[0])
     res = subprocess.run(command, text=True, stdout=subprocess.PIPE,
                          stderr=subprocess.PIPE, check=False)
     if res.returncode:
@@ -95,6 +95,134 @@ def is_google_drive(url: str) -> bool:
     return (urlparse(url).hostname or '').lower() in ('drive.google.com', 'docs.google.com')
 
 
+def aparat_video_hash(page_url: str) -> str:
+    """Get the public Aparat video hash without following arbitrary page URLs."""
+    parsed = urlparse(page_url)
+    if not is_aparat(page_url):
+        raise ValueError('Expected an Aparat player page URL.')
+    match = re.fullmatch(r'/v/([A-Za-z0-9]+)/*', parsed.path)
+    if not match:
+        raise ValueError('Expected a single Aparat video page: https://www.aparat.com/v/VIDEO_ID')
+    return match.group(1)
+
+
+def aparat_media_candidates(payload: dict) -> list[str]:
+    """Parse media links in Aparat's public video-info JSON; do not trust external hosts.
+
+    The website API may change without notice. Skip unknown/malformed entries.
+    """
+    data = payload.get('data', {}) if isinstance(payload, dict) else {}
+    if isinstance(data, list):
+        data = data[0] if data else {}
+    attrs = data.get('attributes', {}) if isinstance(data, dict) else {}
+    if not isinstance(attrs, dict):
+        return []
+    links = attrs.get('file_link_all') or []
+    if not isinstance(links, list):
+        return []
+    ranked = []
+    for item in links:
+        if not isinstance(item, dict):
+            continue
+        label = str(item.get('profile') or item.get('label') or item.get('quality') or '')
+        found = re.search(r'(\d{3,4})[pP]?', label)
+        height = int(found.group(1)) if found else 0
+        # Avoid needlessly downloading 4K files on GitHub's limited disk/compute.
+        if height > 1080:
+            continue
+        urls = item.get('urls') or []
+        if isinstance(urls, str):
+            urls = [urls]
+        for candidate in urls if isinstance(urls, list) else []:
+            if isinstance(candidate, dict):
+                candidate = candidate.get('url') or candidate.get('src') or ''
+            if not isinstance(candidate, str):
+                continue
+            parsed = urlparse(candidate)
+            host = (parsed.hostname or '').lower()
+            # Only the same provider's media hosts; no arbitrary external URLs.
+            if parsed.scheme != 'https' or not (host == 'aparat.com' or host.endswith('.aparat.com')):
+                continue
+            if parsed.username or parsed.password or parsed.port not in (None, 443):
+                continue
+            rank = (height, 1 if parsed.path.lower().endswith('.mp4') else 0)
+            ranked.append((rank, candidate))
+    ranked.sort(key=lambda item: item[0], reverse=True)
+    return list(dict.fromkeys(link for _, link in ranked))
+
+
+def download_aparat_api(page_url: str, work_dir: Path) -> Path:
+    """Resolve the video from Aparat's public JSON endpoint; fail cleanly if blocked.
+
+    This is not an authentication bypass. 403/geo/private limitations remain.
+    """
+    import requests
+    video_id = aparat_video_hash(page_url)
+    endpoint = f'https://www.aparat.com/api/fa/v1/video/video/show/videohash/{video_id}'
+    LOG.info('Trying Aparat public video-info API for video %s', video_id)
+    headers = {'User-Agent': BROWSER_USER_AGENT, 'Accept': 'application/json',
+               'Referer': page_url}
+    response = requests.get(endpoint, timeout=(15, 30), headers=headers)
+    response.raise_for_status()
+    try:
+        data = response.json()
+    except ValueError as exc:
+        raise RuntimeError('Aparat video API did not return JSON.') from exc
+    links = aparat_media_candidates(data)
+    if not links:
+        raise RuntimeError('Aparat public API did not supply a usable media URL.')
+    LOG.info('Aparat API supplied %s media URL(s); trying available formats.', len(links))
+    target = work_dir / 'source.mp4'
+    failures = []
+    # Avoid dozens of CDN attempts in case of server-side IP restrictions.
+    for candidate in links[:10]:
+        try:
+            is_hls = '.m3u8' in urlparse(candidate).path.lower()
+            if is_hls:
+                LOG.info('Trying Aparat HLS source via FFmpeg')
+                media_headers = f'User-Agent: {BROWSER_USER_AGENT}\r\nReferer: {page_url}\r\n'
+                run_cmd(['ffmpeg', '-hide_banner', '-loglevel', 'error', '-nostdin', '-y',
+                         '-headers', media_headers, '-i', candidate, '-c', 'copy',
+                         '-movflags', '+faststart', str(target)], quiet=True)
+            else:
+                LOG.info('Trying Aparat video file from provider CDN')
+                media_headers = {'User-Agent': BROWSER_USER_AGENT,
+                                 'Referer': page_url, 'Origin': 'https://www.aparat.com'}
+                partial = target.with_suffix('.partial')
+                try:
+                    with requests.get(candidate, stream=True, timeout=(20, 120),
+                                      allow_redirects=False, headers=media_headers) as media:
+                        media.raise_for_status()
+                        ctype = media.headers.get('Content-Type', '').lower()
+                        if 'text/html' in ctype or 'application/json' in ctype:
+                            raise ValueError('CDN responded with HTML/JSON rather than video.')
+                        size = int(media.headers.get('Content-Length') or 0)
+                        if size > MAX_DOWNLOAD_BYTES:
+                            raise ValueError('Aparat video exceeds 3GB limit.')
+                        total = 0
+                        with partial.open('wb') as fp:
+                            for chunk in media.iter_content(chunk_size=1024 * 1024):
+                                if chunk:
+                                    total += len(chunk)
+                                    if total > MAX_DOWNLOAD_BYTES:
+                                        raise ValueError('Aparat video exceeds 3GB limit.')
+                                    fp.write(chunk)
+                    partial.replace(target)
+                finally:
+                    partial.unlink(missing_ok=True)
+            if target.is_file() and 0 < target.stat().st_size <= MAX_DOWNLOAD_BYTES:
+                LOG.info('Aparat API download completed successfully.')
+                return target
+            raise RuntimeError('Empty or oversized media file')
+        except Exception as exc:
+            target.unlink(missing_ok=True)
+            failures.append(str(exc)[:140])
+            LOG.warning('Aparat media candidate failed (%s/%s): %s',
+                        len(failures), min(len(links), 10), failures[-1])
+    raise RuntimeError('All Aparat API media links were unavailable from the runner: '
+                       + ' | '.join(failures[:3]))
+
+
 def fetch_video(url: str, work_dir: Path) -> Path:
     """Download a publicly accessible video for which the user has permission.
 
@@ -112,43 +240,57 @@ def fetch_video(url: str, work_dir: Path) -> Path:
         if not result or not target.exists():
             raise RuntimeError('Google Drive download failed. Check link access (Anyone with the link).')
     elif is_youtube(url) or is_aparat(url):
-        import yt_dlp
         provider = 'Aparat' if is_aparat(url) else 'YouTube'
-        LOG.info('Downloading %s player PAGE using yt-dlp (not direct CDN URL)', provider)
-        opts = {
-            'format': 'bv*[height<=1080]+ba/b[height<=1080]/b',
-            'outtmpl': str(work_dir / 'source.%(ext)s'),
-            'merge_output_format': 'mp4',
-            'noplaylist': True,
-            'quiet': False,
-            'retries': 3,
-            'fragment_retries': 3,
-            'http_headers': {'User-Agent': BROWSER_USER_AGENT,
-                             'Referer': 'https://www.aparat.com/' if is_aparat(url) else 'https://www.youtube.com/'},
-        }
-        try:
-            with yt_dlp.YoutubeDL(opts) as ydl:
-                ydl.download([url])
-        except Exception as exc:
-            message = str(exc)
-            if is_aparat(url) and any(word in message.lower() for word in ('403', 'forbidden', 'geo', 'unavailable', 'not available')):
-                raise RuntimeError(
-                    'Aparat player page could not be downloaded from the GitHub runner. '
-                    'The Aparat CDN might restrict GitHub datacenter IPs or your region. '
-                    'Download your authorized video using Aparat in your browser, upload the MP4 to '
-                    'Google Drive with "Anyone with the link" Viewer access, and enter that Drive share URL '
-                    'as video_url. Do not paste caspian*.asset.aparat.com MP4 links.'
-                ) from exc
-            raise RuntimeError(f'{provider} download failed with yt-dlp: {message[-500:]}') from exc
-        candidates = sorted(
-            (p for p in work_dir.glob('source.*') if p.is_file() and p.stat().st_size > 0
-             and not p.suffix in ('.part', '.ytdl')),
-            key=lambda p: p.stat().st_size, reverse=True
-        )
-        if not candidates:
-            raise RuntimeError(f'Video not downloaded from {provider}. '
-                               'Try a publicly accessible Google Drive MP4 instead.')
-        target = candidates[0]
+        errors = []
+        # yt-dlp Aparat extractor has a known 'Unable to extract og:title' issue
+        # (yt-dlp #17425). Try the provider JSON endpoint *before* yt-dlp.
+        if is_aparat(url):
+            try:
+                target = download_aparat_api(url, work_dir)
+            except Exception as exc:
+                errors.append(f'API: {str(exc)[:250]}')
+                LOG.warning('Aparat API route unavailable; trying yt-dlp: %s', str(exc)[:250])
+                target = None
+        else:
+            target = None
+        if target is None:
+            import yt_dlp
+            opts = {
+                'format': 'bv*[height<=1080]+ba/b[height<=1080]/b',
+                'outtmpl': str(work_dir / 'source.%(ext)s'),
+                'merge_output_format': 'mp4',
+                'noplaylist': True,
+                'quiet': False,
+                'retries': 3,
+                'fragment_retries': 3,
+                'http_headers': {'User-Agent': BROWSER_USER_AGENT,
+                                 'Referer': 'https://www.aparat.com/' if is_aparat(url) else 'https://www.youtube.com/'},
+            }
+            LOG.info('Trying %s player page using yt-dlp', provider)
+            try:
+                with yt_dlp.YoutubeDL(opts) as ydl:
+                    ydl.download([url])
+            except Exception as exc:
+                errors.append(f'yt-dlp: {str(exc)[:250]}')
+                if is_aparat(url):
+                    raise RuntimeError(
+                        'Aparat download failed both via the public API and yt-dlp. '
+                        'yt-dlp has a known Aparat og:title extractor bug (issue #17425), '
+                        'and Aparat may block video downloads from GitHub IPs. '
+                        'Upload a video that you have the rights to use to Google Drive, '
+                        'share it as Viewer using Anyone with the link, then pass its URL '
+                        'as video_url or backup_video_url. Details: ' + ' / '.join(errors)
+                    ) from exc
+                raise RuntimeError(f'{provider} download failed: {str(exc)[-400:]}') from exc
+            candidates = sorted(
+                (p for p in work_dir.glob('source.*') if p.is_file() and p.stat().st_size > 0
+                 and p.suffix not in ('.part', '.ytdl', '.partial')),
+                key=lambda p: p.stat().st_size, reverse=True
+            )
+            if not candidates:
+                raise RuntimeError(f'{provider} returned no playable video. Try a Google Drive MP4.')
+            target = candidates[0]
+
     else:
         import requests
         direct_aparat = is_aparat_cdn(url)
@@ -569,7 +711,21 @@ def main() -> None:
         '3) درستی گفته‌ها، زمان آغاز و پایان، مسائل حق نشر و قوانین یوتیوب را پیش از انتشار کنترل کنید.\n'
         '4) این سامانه ویدئو را در یوتیوب منتشر نمی‌کند.\n', encoding='utf-8')
     try:
-        source = fetch_video(url, work_dir)
+        backup_url = os.environ.get('BACKUP_VIDEO_URL', '').strip()
+        try:
+            source = fetch_video(url, work_dir)
+        except Exception as primary_error:
+            if not backup_url:
+                raise
+            LOG.warning('Primary video source failed: %s', str(primary_error)[:400])
+            LOG.info('Trying backup_video_url (e.g. Google Drive authorized MP4)')
+            try:
+                source = fetch_video(backup_url, work_dir)
+            except Exception as backup_error:
+                raise RuntimeError(
+                    f'Both primary video_url and backup_video_url failed. '
+                    f'Primary: {str(primary_error)[:220]}; Backup: {str(backup_error)[:220]}'
+                ) from backup_error
     except Exception as exc:
         (out_dir / 'download-error.txt').write_text(
             'YouTube Clip Studio - download failed\n'
