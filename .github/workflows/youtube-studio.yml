@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       video_url:
-        description: 'لینک صفحه پخش آپارات/یوتیوب، Google Drive یا فایل مستقیم (ویدئوی مجاز)'
+        description: 'لینک صفحه آپارات (aparat.com/v/...)، یوتیوب یا Drive؛ لینک CDN آپارات ندهید'
         required: true
         type: string
       mode:
