@@ -425,7 +425,7 @@ def make_analysis_proxy(source: Path, proxy: Path) -> None:
     """Low-resolution analysis copy preserves the full duration and spoken audio."""
     run_cmd(['ffmpeg', '-hide_banner', '-loglevel', 'error', '-nostdin', '-y',
              '-i', str(source), '-map', '0:v:0', '-map', '0:a:0?',
-             '-vf', 'scale=640:-2:force_original_aspect_ratio=decrease,fps=1',
+             '-vf', 'scale=640:-2:force_original_aspect_ratio=decrease:force_divisible_by=2,fps=1,format=yuv420p',
              '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '33',
              '-c:a', 'aac', '-b:a', '64k', '-ac', '1',
              '-movflags', '+faststart', str(proxy)], quiet=True)
@@ -549,7 +549,7 @@ def render_video(source: Path, dest: Path, start: float, end: float) -> None:
     filt = ('split=2[bg][fg];'
             '[bg]scale=720:1280:force_original_aspect_ratio=increase,'
             'crop=720:1280,boxblur=20:2[back];'
-            '[fg]scale=720:1280:force_original_aspect_ratio=decrease[front];'
+            '[fg]scale=720:1280:force_original_aspect_ratio=decrease:force_divisible_by=2[front];'
             '[back][front]overlay=(W-w)/2:(H-h)/2,format=yuv420p')
     run_cmd(['ffmpeg', '-hide_banner', '-loglevel', 'error', '-nostdin', '-y',
              '-ss', str(start), '-t', str(end - start), '-i', str(source),
