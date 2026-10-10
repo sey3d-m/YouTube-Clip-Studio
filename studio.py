@@ -1,0 +1,518 @@
+#!/usr/bin/env python3
+"""YouTube Clip Studio — video -> Gemini editorial plan -> FFmpeg Shorts -> release pack.
+Runs in GitHub Actions; no persistent server. Python 3.11+.
+"""
+from __future__ import annotations
+
+import csv
+import html
+import json
+import logging
+import os
+import re
+import shutil
+import subprocess
+import sys
+import time
+from pathlib import Path
+from urllib.parse import parse_qs, urlparse
+
+from pydantic import BaseModel, Field
+
+LOG = logging.getLogger('clip-studio')
+MAX_DOWNLOAD_BYTES = 3 * 1024**3
+LANGUAGES = {'fa': 'فارسی', 'bn': 'বাংলা', 'ar': 'العربية', 'en': 'English'}
+
+
+class Candidate(BaseModel):
+    start: float = Field(description='Start timestamp in seconds, relative to source video')
+    end: float = Field(description='End timestamp in seconds, relative to source video')
+    title: str = ''
+    alternative_titles: list[str] = Field(default_factory=list)
+    description: str = ''
+    hashtags: list[str] = Field(default_factory=list)
+    tags: list[str] = Field(default_factory=list)
+    pinned_comment: str = ''
+    cover_text: str = ''
+    why_selected: str = ''
+
+
+class Plan(BaseModel):
+    video_summary: str = ''
+    clips: list[Candidate] = Field(default_factory=list)
+
+
+def run_cmd(command: list[str], *, quiet: bool = False) -> str:
+    LOG.info('Executing: %s', ' '.join(command[:10]))
+    res = subprocess.run(command, text=True, stdout=subprocess.PIPE,
+                         stderr=subprocess.PIPE, check=False)
+    if res.returncode:
+        raise RuntimeError(f"Command failed ({res.returncode}): {' '.join(command[:4])}\n{res.stderr[-2400:]}")
+    if not quiet and res.stderr:
+        LOG.debug('Command stderr: %s', res.stderr[-300:])
+    return res.stdout
+
+
+def seconds_to_hms(seconds: float) -> str:
+    total = int(max(0, seconds))
+    return f'{total // 3600:02d}:{(total % 3600) // 60:02d}:{total % 60:02d}'
+
+
+def youtube_timestamp_link(url: str, start: float) -> str:
+    parsed = urlparse(url)
+    host = (parsed.hostname or '').lower()
+    video_id = None
+    if host in ('youtube.com', 'www.youtube.com', 'm.youtube.com'):
+        video_id = parse_qs(parsed.query).get('v', [''])[0]
+        if not video_id and parsed.path.startswith('/shorts/'):
+            video_id = parsed.path.split('/')[2]
+    elif host in ('youtu.be', 'www.youtu.be'):
+        video_id = parsed.path.strip('/').split('/')[0]
+    if video_id and re.fullmatch(r'[a-zA-Z0-9_-]{11}', video_id):
+        return f'https://www.youtube.com/watch?v={video_id}&t={int(start)}s'
+    return ''
+
+
+def is_youtube(url: str) -> bool:
+    return (urlparse(url).hostname or '').lower() in (
+        'youtube.com', 'www.youtube.com', 'm.youtube.com', 'youtu.be', 'www.youtu.be'
+    )
+
+
+def is_google_drive(url: str) -> bool:
+    return (urlparse(url).hostname or '').lower() in ('drive.google.com', 'docs.google.com')
+
+
+def fetch_video(url: str, work_dir: Path) -> Path:
+    """Download a video from a URL; private Drive files need a separate connector (not provided)."""
+    if not url.startswith(('https://', 'http://')):
+        raise ValueError('VIDEO_URL must start with https:// or http://')
+    target = work_dir / 'source.mp4'
+    if is_google_drive(url):
+        import gdown
+        LOG.info('Downloading Google Drive share file (must be accessible to the runner)')
+        result = gdown.download(url=url, output=str(target), quiet=False, fuzzy=True)
+        if not result or not target.exists():
+            raise RuntimeError('Google Drive download failed. Check link access (Anyone with the link).')
+    elif is_youtube(url):
+        import yt_dlp
+        LOG.info('Downloading video from YouTube. Only use content you are entitled to process.')
+        opts = {
+            'format': 'bv*[height<=1080]+ba/b[height<=1080]/b',
+            'outtmpl': str(work_dir / 'source.%(ext)s'),
+            'merge_output_format': 'mp4',
+            'noplaylist': True,
+            'quiet': False,
+            'retries': 3,
+        }
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            ydl.download([url])
+        candidates = sorted(work_dir.glob('source.*'), key=lambda p: p.stat().st_size, reverse=True)
+        if not candidates:
+            raise RuntimeError('Video not downloaded from YouTube; GitHub-hosted IP may be restricted.')
+        target = candidates[0]
+    else:
+        import requests
+        LOG.info('Downloading direct video URL')
+        with requests.get(url, stream=True, timeout=(25, 180), allow_redirects=True) as resp:
+            resp.raise_for_status()
+            mime = resp.headers.get('Content-Type', '').lower()
+            if 'text/html' in mime:
+                raise ValueError('This URL returned an HTML page instead of a video; use a direct file URL.')
+            reported = int(resp.headers.get('content-length') or 0)
+            if reported > MAX_DOWNLOAD_BYTES:
+                raise ValueError('Input exceeds 3GB safety limit.')
+            total = 0
+            with target.open('wb') as f:
+                for chunk in resp.iter_content(chunk_size=1024 * 1024):
+                    if not chunk:
+                        continue
+                    total += len(chunk)
+                    if total > MAX_DOWNLOAD_BYTES:
+                        raise ValueError('Input exceeds 3GB safety limit.')
+                    f.write(chunk)
+    if target.stat().st_size == 0 or target.stat().st_size > MAX_DOWNLOAD_BYTES:
+        raise ValueError('Empty or oversized video (limit: 3GB).')
+    LOG.info('Downloaded: %.1f MB', target.stat().st_size / 1024**2)
+    return target
+
+
+def video_duration(path: Path) -> float:
+    raw = run_cmd(['ffprobe', '-v', 'error', '-show_entries', 'format=duration',
+                   '-of', 'default=noprint_wrappers=1:nokey=1', str(path)], quiet=True)
+    duration = float(raw.strip())
+    if duration <= 0:
+        raise ValueError('Video has no valid duration')
+    return duration
+
+
+def make_analysis_proxy(source: Path, proxy: Path) -> None:
+    """Low-resolution analysis copy preserves the full duration and spoken audio."""
+    run_cmd(['ffmpeg', '-hide_banner', '-loglevel', 'error', '-nostdin', '-y',
+             '-i', str(source), '-map', '0:v:0', '-map', '0:a:0?',
+             '-vf', 'scale=640:-2:force_original_aspect_ratio=decrease,fps=1',
+             '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '33',
+             '-c:a', 'aac', '-b:a', '64k', '-ac', '1',
+             '-movflags', '+faststart', str(proxy)], quiet=True)
+    LOG.info('Analysis proxy: %.1f MB', proxy.stat().st_size / 1024**2)
+
+
+def editorial_prompt(duration: float, *, mode: str, language: str,
+                     count: int, min_seconds: int, max_seconds: int, subject: str) -> str:
+    language_name = LANGUAGES.get(language, LANGUAGES['fa'])
+    base = f'''You are an expert editor for an educational YouTube channel. Analyze this ACTUAL video including its audio.
+Video duration: {duration:.2f} seconds. Timecodes MUST be seconds relative to the ORIGINAL video, not approximate chapter labels.
+Output language for all public-facing copy: {language_name}. Extra context / priority: {subject or 'educational, accurate, professional'}.
+Create metadata that faithfully reflects the spoken content. Do NOT fabricate quotations, hadith references, verses, events, names, sources or claims not stated in the video. Avoid unsupported sensationalism and policy-violating wording.
+Write a useful natural-language description (about 2-5 lines), 3 alternative non-identical clickable yet truthful titles, 4-7 hashtags each with '#', and 7-12 search tags without '#'. Provide a relevant pinned question/comment and very short 2-6 word cover_text. Keep writing clean and publishable.
+We need complete thoughts and intelligible opening/closing; no mid-sentence cuts. Clip recommendations are editorial suggestions requiring human verification of boundaries.
+'''
+    if mode == 'precut':
+        return base + '''This is ALREADY ONE EDITED CLIP. Return exactly one item in clips, start=0, end=video duration. Do NOT extract extra sections; create only the publication package.''' 
+    return base + f'''This is a longer source video. Identify at most {count} non-overlapping, high-value extracts. Each extract MUST be between {min_seconds} and {max_seconds} seconds, and MUST be genuinely present in the source. Prefer a striking question, clear argument, useful educational fact, or concise response to a misconception. Avoid intros, gaps and repeated ideas. Sort clips in source chronology. If no valid segments exist, return clips=[]. Give a short why_selected reason for each segment.''' 
+
+
+def gemini_plan(video_path: Path, prompt: str, primary_model: str) -> tuple[Plan, str]:
+    """Gemini Files API with transient retries; delete remote file in finally."""
+    from google import genai
+    from google.genai import types
+    key = os.environ.get('GEMINI_API_KEY', '')
+    if not key:
+        raise RuntimeError('Missing repository secret: GEMINI_API_KEY')
+    client = genai.Client(api_key=key)
+    remote = None
+    try:
+        remote = client.files.upload(file=str(video_path), config={'mime_type': 'video/mp4'})
+        for _ in range(90):
+            state = getattr(getattr(remote, 'state', None), 'name', None)
+            if state == 'ACTIVE':
+                break
+            if state == 'FAILED':
+                raise RuntimeError('Gemini file processing failed')
+            LOG.info('Gemini preparing uploaded video; state=%s', state)
+            time.sleep(5)
+            remote = client.files.get(name=remote.name)
+        else:
+            raise TimeoutError('Gemini File API did not activate the video in 7.5 minutes.')
+
+        models = list(dict.fromkeys([primary_model, 'gemini-3.5-flash-lite']))
+        last_error = None
+        for model in models:
+            for attempt in range(1, 5):
+                try:
+                    LOG.info('Generating plan with %s (attempt %s/4)', model, attempt)
+                    response = client.models.generate_content(
+                        model=model,
+                        contents=[remote, prompt],
+                        config=types.GenerateContentConfig(
+                            response_mime_type='application/json',
+                            response_schema=Plan,
+                            temperature=0.35,
+                        ),
+                    )
+                    parsed = getattr(response, 'parsed', None)
+                    plan = parsed if isinstance(parsed, Plan) else Plan.model_validate_json(response.text)
+                    if not plan.clips:
+                        raise ValueError('Model returned no valid clip suggestions.')
+                    return plan, model
+                except Exception as exc:
+                    last_error = exc
+                    message = str(exc).lower()
+                    transient = any(t in message for t in (
+                        '429', '503', '500', '502', '504', 'unavailable', 'deadline',
+                        'resource_exhausted', 'high demand', 'temporarily', 'timeout'
+                    ))
+                    LOG.warning('Gemini attempt failed: %s', str(exc)[:300])
+                    if not transient:
+                        raise
+                    if attempt < 4:
+                        delay = min(70, 6 * 2 ** (attempt - 1))
+                        time.sleep(delay)
+            LOG.warning('Model %s exhausted transient retries; switching if possible.', model)
+        raise RuntimeError(f'All Gemini models failed. Last error: {last_error}')
+    finally:
+        if remote is not None:
+            try:
+                client.files.delete(name=remote.name)
+                LOG.info('Deleted temporary file from Gemini Files API')
+            except Exception as exc:
+                LOG.warning('Unable to delete Gemini temporary file: %s', exc)
+
+
+def normalize_clips(items: list[Candidate], duration: float, min_seconds: int,
+                    max_seconds: int, count: int, mode: str) -> tuple[list[Candidate], list[str]]:
+    """Do not silently fix AI timestamps or choose arbitrary source segments."""
+    if mode == 'precut' and items:
+        clip = items[0].model_copy(deep=True)
+        clip.start, clip.end = 0.0, round(duration, 2)
+        return [clip], []
+    valid: list[Candidate] = []
+    rejected: list[str] = []
+    for clip in items:
+        start, end = float(clip.start), float(clip.end)
+        length = end - start
+        reason = ''
+        if start < 0 or end > duration + 0.5 or end <= start:
+            reason = 'out of range / reversed'
+        elif length < min_seconds or length > max_seconds:
+            reason = f'duration={length:.1f}s outside [{min_seconds},{max_seconds}]'
+        elif any(start < old.end - 0.3 and end > old.start + 0.3 for old in valid):
+            reason = 'overlaps a previously selected clip'
+        elif not clip.title.strip():
+            reason = 'missing title'
+        if reason:
+            rejected.append(f'{seconds_to_hms(start)}-{seconds_to_hms(end)} {reason}')
+        else:
+            valid.append(clip)
+        if len(valid) >= count:
+            break
+    return valid, rejected
+
+
+def render_video(source: Path, dest: Path, start: float, end: float) -> None:
+    """720x1280 Shorts; blurred background preserves original full horizontal frame."""
+    filt = ('split=2[bg][fg];'
+            '[bg]scale=720:1280:force_original_aspect_ratio=increase,'
+            'crop=720:1280,boxblur=20:2[back];'
+            '[fg]scale=720:1280:force_original_aspect_ratio=decrease[front];'
+            '[back][front]overlay=(W-w)/2:(H-h)/2,format=yuv420p')
+    run_cmd(['ffmpeg', '-hide_banner', '-loglevel', 'error', '-nostdin', '-y',
+             '-ss', str(start), '-t', str(end - start), '-i', str(source),
+             '-vf', filt, '-map', '0:v:0', '-map', '0:a:0?',
+             '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '27',
+             '-maxrate', '1700k', '-bufsize', '3400k',
+             '-c:a', 'aac', '-b:a', '96k', '-ac', '2',
+             '-movflags', '+faststart', str(dest)], quiet=True)
+
+
+def _font(size: int):
+    from PIL import ImageFont
+    fonts = [
+        '/usr/share/fonts/truetype/noto/NotoNaskhArabic-Bold.ttf',
+        '/usr/share/fonts/truetype/noto/NotoSansArabic-Bold.ttf',
+        '/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf',
+        'C:/Windows/Fonts/tahomabd.ttf',
+    ]
+    for path in fonts:
+        if Path(path).is_file():
+            return ImageFont.truetype(path, size=size)
+    return ImageFont.load_default()
+
+
+def _rtl_display(text: str) -> str:
+    if not re.search(r'[\u0600-\u06ff]', text):
+        return text
+    import arabic_reshaper
+    from bidi.algorithm import get_display
+    return get_display(arabic_reshaper.reshape(text))
+
+
+def create_cover(video: Path, destination: Path, title: str) -> None:
+    """A draft landscape cover; Shorts thumbnail selection may need YouTube mobile app."""
+    from PIL import Image, ImageDraw, ImageEnhance, ImageFilter
+    frame = destination.with_suffix('.frame.jpg')
+    run_cmd(['ffmpeg', '-hide_banner', '-loglevel', 'error', '-nostdin', '-y',
+             '-ss', '0.7', '-i', str(video), '-frames:v', '1', str(frame)], quiet=True)
+    with Image.open(frame) as im:
+        image = im.convert('RGB')
+    frame.unlink(missing_ok=True)
+    # Use a darkened, blurred full-frame background in 16:9, overlay a clear centered face/frame.
+    w, h = image.size
+    scale = max(1280 / w, 720 / h)
+    bg = image.resize((round(w * scale), round(h * scale)), Image.Resampling.LANCZOS)
+    left, top = (bg.width - 1280) // 2, (bg.height - 720) // 2
+    bg = bg.crop((left, top, left + 1280, top + 720)).filter(ImageFilter.GaussianBlur(9))
+    bg = ImageEnhance.Brightness(bg).enhance(0.50)
+    draw = ImageDraw.Draw(bg, 'RGBA')
+    draw.rounded_rectangle((58, 63, 390, 128), radius=24, fill=(244, 183, 40, 230))
+    draw.text((81, 74), 'YOUTUBE CLIP', font=_font(33), fill=(20, 25, 40, 255))
+    clean = (title or 'کلیپ منتخب').strip().replace('\n', ' ')
+    clean = clean[:90]
+    text_size = 74 if len(clean) < 40 else 57
+    font = _font(text_size)
+    # Simple length-based line wrapping, with shaping for Persian/Arabic.
+    max_chars = 24 if text_size >= 70 else 30
+    words = clean.split()
+    lines, cur = [], ''
+    for word in words:
+        new = (cur + ' ' + word).strip()
+        if len(new) > max_chars and cur:
+            lines.append(cur)
+            cur = word
+        else:
+            cur = new
+    if cur:
+        lines.append(cur)
+    lines = lines[:3]
+    y = 335 - (len(lines) - 1) * 44
+    for line in lines:
+        shaped = _rtl_display(line)
+        bbox = draw.textbbox((0, 0), shaped, font=font, stroke_width=2)
+        tw = bbox[2] - bbox[0]
+        x = max(40, (1280 - tw) // 2)
+        draw.text((x, y), shaped, font=font, fill='white',
+                  stroke_width=3, stroke_fill=(12, 21, 39, 255))
+        y += text_size + 20
+    bg.save(destination, format='JPEG', quality=88, optimize=True)
+
+
+def write_metadata(out_dir: Path, clip: Candidate, number: int, source_url: str) -> dict:
+    filename = f'clip-{number:02d}'
+    base = out_dir / 'metadata'
+    base.mkdir(parents=True, exist_ok=True)
+    row = clip.model_dump()
+    row['source_start_hms'] = seconds_to_hms(clip.start)
+    row['source_end_hms'] = seconds_to_hms(clip.end)
+    row['source_video_timestamp_link'] = youtube_timestamp_link(source_url, clip.start)
+    row['video_file'] = f'clips/{filename}.mp4'
+    row['cover_file'] = f'covers/{filename}.jpg'
+    (base / f'{filename}.json').write_text(json.dumps(row, ensure_ascii=False, indent=2), encoding='utf-8')
+    alts = '\n'.join(f'  - {s}' for s in clip.alternative_titles)
+    lines = [
+        f'کلیپ {number} — بسته انتشار یوتیوب',
+        f'برش: {row["source_start_hms"]} تا {row["source_end_hms"]}',
+        f'لینک تایم‌دار منبع: {row["source_video_timestamp_link"]}', '',
+        'تیتر اصلی:', clip.title, '',
+        'تیترهای جایگزین:', alts, '',
+        'توضیحات:', clip.description, '',
+        'هشتگ‌ها:', ' '.join(clip.hashtags), '',
+        'تگ‌های YouTube Studio:', ', '.join(clip.tags), '',
+        'کامنت پین‌شده:', clip.pinned_comment, '',
+        'متن روی کاور:', clip.cover_text, '',
+        'دلیل انتخاب کلیپ:', clip.why_selected, '',
+        'پیش از انتشار، محتوا، مرز برش‌ها و صحت عبارات را انسانی بررسی کنید.'
+    ]
+    (base / f'{filename}.txt').write_text('\n'.join(lines), encoding='utf-8')
+    return row
+
+
+def dashboard(out_dir: Path, items: list[dict], summary: str, rejects: list[str]) -> None:
+    esc = lambda s: html.escape(str(s or ''))
+    cards = []
+    for idx, c in enumerate(items, start=1):
+        video = f'clips/clip-{idx:02d}.mp4'
+        cover = f'covers/clip-{idx:02d}.jpg'
+        title_options = '\n'.join([c.get('title', '')] + c.get('alternative_titles', []))
+        copytext = '\n\n'.join([c.get('title', ''), c.get('description', ''),
+                                    ' '.join(c.get('hashtags', [])), c.get('pinned_comment', '')])
+        cards.append(f'''
+        <article class="card">
+          <div class="preview"><video controls preload="metadata" src="{video}" poster="{cover}"></video></div>
+          <div class="info"><div class="minor">کلیپ {idx:02d} | {esc(c['source_start_hms'])} تا {esc(c['source_end_hms'])}</div>
+          <h2>{esc(c.get('title'))}</h2>
+          <div class="pair"><strong>۳ تیتر پیشنهادی</strong><p>{esc(title_options)}</p></div>
+          <div class="pair"><strong>توضیحات یوتیوب</strong><p>{esc(c.get('description'))}</p></div>
+          <div class="pair"><strong>هشتگ‌ها</strong><p>{esc(' '.join(c.get('hashtags', [])))}</p></div>
+          <div class="pair"><strong>تگ‌ها</strong><p>{esc(', '.join(c.get('tags', [])))}</p></div>
+          <div class="pair"><strong>کامنت پین‌شده</strong><p>{esc(c.get('pinned_comment'))}</p></div>
+          <div class="pair"><strong>دلیل انتخاب</strong><p>{esc(c.get('why_selected'))}</p></div>
+          <a href="{video}" download>دریافت MP4</a> · <a href="{cover}" download>کاور JPG</a> · <a href="metadata/clip-{idx:02d}.txt" download>متن بسته انتشار</a>
+          <button type="button" onclick="copyPack(this)">کپی متن انتشار</button>
+          <textarea hidden class="copy">{esc(copytext)}</textarea></div>
+        </article>''')
+    message = '<br>'.join(esc(x) for x in rejects)
+    page = f'''<!DOCTYPE html><html lang="fa" dir="rtl"><head><meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>YouTube Clip Studio | خروجی</title><style>
+    :root{{--bg:#0b1323;--card:#142037;--line:#2c3b56;--text:#eef3ff;--muted:#adbed5;--accent:#f6bd45}}
+    *{{box-sizing:border-box}}body{{margin:0;background:var(--bg);color:var(--text);font:16px tahoma,Arial,sans-serif;line-height:1.85}}
+    .container{{max-width:1260px;margin:0 auto;padding:34px 20px}}header{{border:1px solid var(--line);background:linear-gradient(120deg,#1d3458,#111d31);padding:38px;border-radius:20px;margin-bottom:25px}}
+    h1{{font-size:32px;margin:0 0 7px}}h2{{font-size:24px;line-height:1.65;margin:4px 0 24px}}p{{margin:6px 0;white-space:pre-wrap}}
+    .eyebrow,.minor{{color:var(--accent);font-weight:bold;font-size:13px}}.muted{{color:var(--muted)}}.card{{display:grid;grid-template-columns:340px 1fr;gap:26px;background:var(--card);border:1px solid var(--line);border-radius:20px;margin-bottom:20px;padding:22px}}
+    .preview video{{width:100%;aspect-ratio:9 / 16;max-height:600px;object-fit:contain;background:black;border-radius:14px}}
+    .pair{{border-top:1px solid var(--line);padding:10px 0}}strong{{color:#dae5f8}}a{{color:#9dd7ff;display:inline-block;margin:14px 0 0 12px;text-decoration:none}}
+    button{{display:inline-block;background:var(--accent);padding:10px 18px;border:0;border-radius:9px;color:#13213a;font-weight:bold;cursor:pointer;margin-top:12px}}
+    footer{{color:var(--muted);margin:25px 0;font-size:13px}}@media(max-width:800px){{.card{{grid-template-columns:1fr}}.preview video{{max-height:470px}}h1{{font-size:25px}}header{{padding:25px}}}}
+    </style></head><body><main class="container"><header><div class="eyebrow">YOUTUBE CLIP STUDIO · GITHUB ACTIONS</div>
+    <h1>بسته‌های آماده تدوین و انتشار</h1><p class="muted">{esc(summary)}</p><p>{len(items)} کلیپ ساخته شده است. هر ویدئو و متن را پیش از انتشار بررسی کنید.</p></header>
+    {''.join(cards)}{'<p class="muted">برش‌های ردشده: ' + message + '</p>' if rejects else ''}
+    <footer>این گزارش مستقل و آفلاین است. انتشار در یوتیوب خودکار انجام نمی‌شود. برای Shorts، انتخاب تصویر بندانگشتی ممکن است از داخل اپلیکیشن یوتیوب انجام شود.</footer></main>
+    <script>function copyPack(btn){{let box=btn.parentElement.querySelector('.copy');let t=box.value;let done=()=>{{btn.textContent='کپی شد';setTimeout(()=>btn.textContent='کپی متن انتشار',1500)}};if(navigator.clipboard){{navigator.clipboard.writeText(t).then(done).catch(()=>fallback())}}else{{fallback()}}function fallback(){{box.hidden=false;box.select();document.execCommand('copy');box.hidden=true;done()}}}}</script></body></html>'''
+    (out_dir / 'dashboard.html').write_text(page, encoding='utf-8')
+
+
+def main() -> None:
+    logging.basicConfig(level=logging.INFO, format='%(asctime)s | %(levelname)s | %(message)s')
+    url = os.environ.get('VIDEO_URL', '').strip()
+    mode = os.environ.get('STUDIO_MODE', 'automatic')
+    language = os.environ.get('STUDIO_LANGUAGE', 'fa')
+    model = os.environ.get('STUDIO_MODEL', 'gemini-3.8-flash')
+    subject = os.environ.get('STUDIO_SUBJECT', '')
+    count = int(os.environ.get('STUDIO_COUNT', '4'))
+    min_seconds = int(os.environ.get('STUDIO_MIN_SECONDS', '25'))
+    max_seconds = int(os.environ.get('STUDIO_MAX_SECONDS', '65'))
+    out_dir = Path(os.environ.get('OUTPUT_DIR', 'output')).resolve()
+    work_dir = Path('work').resolve()
+    if mode not in ('automatic', 'precut') or language not in LANGUAGES:
+        raise ValueError('Unknown mode or language')
+    if not 1 <= count <= 6 or not 8 <= min_seconds <= max_seconds <= 180:
+        raise ValueError('Invalid clip count or length interval')
+    if not url:
+        raise ValueError('VIDEO_URL input is empty')
+    out_dir.mkdir(parents=True, exist_ok=True)
+    work_dir.mkdir(parents=True, exist_ok=True)
+    (out_dir / 'clips').mkdir(exist_ok=True)
+    (out_dir / 'covers').mkdir(exist_ok=True)
+    (out_dir / 'metadata').mkdir(exist_ok=True)
+    (out_dir / 'README-OUTPUT.txt').write_text(
+        '1) dashboard.html را باز کنید.\n2) پوشه clips و metadata را بررسی کنید.\n'
+        '3) درستی گفته‌ها، زمان آغاز و پایان، مسائل حق نشر و قوانین یوتیوب را پیش از انتشار کنترل کنید.\n'
+        '4) این سامانه ویدئو را در یوتیوب منتشر نمی‌کند.\n', encoding='utf-8')
+    source = fetch_video(url, work_dir)
+    duration = video_duration(source)
+    LOG.info('Source duration: %.2f seconds', duration)
+    if mode == 'automatic' and duration < min_seconds:
+        raise ValueError('Input is shorter than min_seconds. Select precut mode instead.')
+    proxy = work_dir / 'analysis.mp4'
+    make_analysis_proxy(source, proxy)
+    prompt = editorial_prompt(duration, mode=mode, language=language, count=count,
+                              min_seconds=min_seconds, max_seconds=max_seconds, subject=subject)
+    plan, actual_model = gemini_plan(proxy, prompt, model)
+    clips, rejects = normalize_clips(plan.clips, duration, min_seconds, max_seconds, count, mode)
+    if not clips:
+        (out_dir / 'rejected.json').write_text(json.dumps(rejects, ensure_ascii=False, indent=2), encoding='utf-8')
+        raise RuntimeError('No valid segments after timestamp/duration validation. See rejected.json.')
+    rows = []
+    for number, clip in enumerate(clips, start=1):
+        vid_path = out_dir / 'clips' / f'clip-{number:02d}.mp4'
+        cover_path = out_dir / 'covers' / f'clip-{number:02d}.jpg'
+        LOG.info('Rendering clip %d: %.2f-%.2f', number, clip.start, clip.end)
+        render_video(source, vid_path, clip.start, clip.end)
+        try:
+            create_cover(vid_path, cover_path, clip.cover_text or clip.title)
+        except Exception as exc:
+            LOG.warning('Stylized cover failed; trying plain video frame: %s', exc)
+            try:
+                run_cmd(['ffmpeg', '-hide_banner', '-loglevel', 'error', '-nostdin', '-y',
+                         '-ss', '0.5', '-i', str(vid_path), '-frames:v', '1',
+                         str(cover_path)], quiet=True)
+            except Exception as cover_exc:
+                LOG.warning('No cover available: %s', cover_exc)
+        rows.append(write_metadata(out_dir, clip, number, url))
+    with (out_dir / 'cut-list.csv').open('w', encoding='utf-8-sig', newline='') as f:
+        writer = csv.writer(f)
+        writer.writerow(['number', 'start_seconds', 'end_seconds', 'start_hms', 'end_hms', 'title', 'reason'])
+        for n, clip in enumerate(clips, start=1):
+            writer.writerow([n, clip.start, clip.end, seconds_to_hms(clip.start),
+                             seconds_to_hms(clip.end), clip.title, clip.why_selected])
+    dashboard(out_dir, rows, plan.video_summary, rejects)
+    manifest = {'source_url': url, 'duration_seconds': duration, 'model': actual_model,
+                'language': language, 'mode': mode, 'summary': plan.video_summary,
+                'clips': rows, 'rejected': rejects}
+    (out_dir / 'manifest.json').write_text(json.dumps(manifest, indent=2, ensure_ascii=False), encoding='utf-8')
+    if os.environ.get('GITHUB_STEP_SUMMARY'):
+        with open(os.environ['GITHUB_STEP_SUMMARY'], 'a', encoding='utf-8') as f:
+            f.write(f'### YouTube Clip Studio\n\nCreated **{len(rows)}** clip(s). '
+                    f'Output includes `dashboard.html`, MP4 clips and metadata. '
+                    f'Download the **youtube-studio** artifact below.\n')
+    LOG.info('Done: %d clips. Read output/dashboard.html', len(rows))
+    # Keep source and proxy off artifacts; no large persistent storage on GitHub.
+    shutil.rmtree(work_dir, ignore_errors=True)
+
+
+if __name__ == '__main__':
+    try:
+        main()
+    except Exception as error:
+        logging.exception('Studio failed: %s', error)
+        sys.exit(1)
