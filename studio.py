@@ -45,14 +45,40 @@ class Plan(BaseModel):
 
 
 def run_cmd(command: list[str], *, quiet: bool = False) -> str:
-    LOG.info('Executing media command: %s', command[0])
-    res = subprocess.run(command, text=True, stdout=subprocess.PIPE,
-                         stderr=subprocess.PIPE, check=False)
+    """Run FFmpeg tools with bounded time and visible exit status.
+
+    Old versions logged only the start of ffprobe; if a runner was interrupted
+    the log offered no evidence of whether the probe completed.
+    """
+    tool = Path(command[0]).name
+    timeout = 90 if tool == 'ffprobe' else 3600
+    LOG.info('Executing media command: %s (timeout=%ss)', tool, timeout)
+    started = time.monotonic()
+    try:
+        res = subprocess.run(command, text=True, stdout=subprocess.PIPE,
+                             stderr=subprocess.PIPE, check=False, timeout=timeout)
+    except subprocess.TimeoutExpired as exc:
+        raise RuntimeError(f'{tool} timed out after {timeout}s. The file may be damaged, '
+                           'incomplete, or too computationally expensive.') from exc
+    duration = time.monotonic() - started
+    LOG.info('Media command %s finished: exit=%d in %.2fs', tool, res.returncode, duration)
     if res.returncode:
-        raise RuntimeError(f"Command failed ({res.returncode}): {' '.join(command[:4])}\n{res.stderr[-2400:]}")
+        raise RuntimeError(f"{tool} exited with code {res.returncode}. "
+                           f"Diagnostic stderr: {res.stderr[-1600:]}")
     if not quiet and res.stderr:
         LOG.debug('Command stderr: %s', res.stderr[-300:])
     return res.stdout
+
+
+def write_progress(out_dir: Path, phase: str, **data) -> None:
+    """Checkpoint progress so a cancelled/SIGKILL job still leaves evidence."""
+    out_dir.mkdir(parents=True, exist_ok=True)
+    record = {'phase': phase, 'unix_time': round(time.time(), 1), **data}
+    target = out_dir / 'run-status.json'
+    partial = out_dir / 'run-status.tmp'
+    partial.write_text(json.dumps(record, ensure_ascii=False, indent=2), encoding='utf-8')
+    partial.replace(target)
+    LOG.info('Progress checkpoint: %s', phase)
 
 
 def seconds_to_hms(seconds: float) -> str:
@@ -342,13 +368,57 @@ def fetch_video(url: str, work_dir: Path) -> Path:
     return target
 
 
-def video_duration(path: Path) -> float:
-    raw = run_cmd(['ffprobe', '-v', 'error', '-show_entries', 'format=duration',
-                   '-of', 'default=noprint_wrappers=1:nokey=1', str(path)], quiet=True)
-    duration = float(raw.strip())
-    if duration <= 0:
-        raise ValueError('Video has no valid duration')
-    return duration
+def video_duration(path: Path, diagnostics_dir: Path | None = None) -> float:
+    """Validate the downloaded bytes before sending any video to Gemini.
+
+    A successful HTTP transfer does not guarantee a playable MP4.  Save a
+    small probe report and avoid archiving the entire source on GitHub.
+    """
+    if not path.is_file() or path.stat().st_size < 1024:
+        raise ValueError('Downloaded file is missing or unusually small.')
+    if diagnostics_dir:
+        diagnostics_dir.mkdir(parents=True, exist_ok=True)
+    size = path.stat().st_size
+    with path.open('rb') as media:
+        head = media.read(64)
+    info = {'bytes': size, 'file_header_hex': head[:24].hex(),
+            'mp4_ftyp_present': head[4:8] == b'ftyp'}
+    if head.lstrip().lower().startswith((b'<!doctype html', b'<html', b'{"error"')):
+        raise RuntimeError('The CDN returned an HTML/JSON error document rather than video.')
+    LOG.info('Checking downloaded media: %.2f MB; MP4 signature=%s',
+             size / 1024**2, info['mp4_ftyp_present'])
+    try:
+        raw = run_cmd(['ffprobe', '-hide_banner', '-v', 'error', '-show_entries',
+                       'format=duration,format_name:stream=index,codec_type,codec_name,duration',
+                       '-of', 'json', str(path)], quiet=True)
+        parsed = json.loads(raw)
+        streams = parsed.get('streams') or []
+        if not any(x.get('codec_type') == 'video' for x in streams):
+            raise ValueError('No video stream found in downloaded file.')
+        fmt = parsed.get('format') or {}
+        raw_duration = fmt.get('duration')
+        if not raw_duration:
+            raw_duration = next((x.get('duration') for x in streams
+                                 if x.get('codec_type') == 'video' and x.get('duration')), None)
+        duration = float(raw_duration)
+        if not 0 < duration < 48 * 3600:
+            raise ValueError(f'Invalid video duration: {duration}')
+        info.update({'valid': True, 'duration_seconds': duration,
+                     'format': fmt.get('format_name', ''),
+                     'streams': [{'type': x.get('codec_type'), 'codec': x.get('codec_name')}
+                                 for x in streams]})
+        LOG.info('Media validated: duration=%.1fs, format=%s, streams=%s',
+                 duration, info['format'], info['streams'])
+        return duration
+    except Exception as exc:
+        info.update({'valid': False, 'error': str(exc)[-1500:]})
+        raise RuntimeError('Downloaded  media file cannot be probed reliably. '
+                           'The direct Aparat link might return an incomplete/damaged MP4. '
+                           f'Details: {str(exc)[-650:]}') from exc
+    finally:
+        if diagnostics_dir:
+            (diagnostics_dir / 'media-probe.json').write_text(
+                json.dumps(info, ensure_ascii=False, indent=2), encoding='utf-8')
 
 
 def make_analysis_proxy(source: Path, proxy: Path) -> None:
@@ -703,6 +773,7 @@ def main() -> None:
         raise ValueError('VIDEO_URL input is empty')
     out_dir.mkdir(parents=True, exist_ok=True)
     work_dir.mkdir(parents=True, exist_ok=True)
+    write_progress(out_dir, 'initialized', mode=mode, count=count, min_seconds=min_seconds, max_seconds=max_seconds)
     (out_dir / 'clips').mkdir(exist_ok=True)
     (out_dir / 'covers').mkdir(exist_ok=True)
     (out_dir / 'metadata').mkdir(exist_ok=True)
@@ -710,6 +781,7 @@ def main() -> None:
         '1) dashboard.html را باز کنید.\n2) پوشه clips و metadata را بررسی کنید.\n'
         '3) درستی گفته‌ها، زمان آغاز و پایان، مسائل حق نشر و قوانین یوتیوب را پیش از انتشار کنترل کنید.\n'
         '4) این سامانه ویدئو را در یوتیوب منتشر نمی‌کند.\n', encoding='utf-8')
+    write_progress(out_dir, 'downloading')
     try:
         backup_url = os.environ.get('BACKUP_VIDEO_URL', '').strip()
         try:
@@ -736,15 +808,22 @@ def main() -> None:
             'to Google Drive and use its share URL.\n',
             encoding='utf-8')
         raise
-    duration = video_duration(source)
+    write_progress(out_dir, 'downloaded', bytes=source.stat().st_size)
+    write_progress(out_dir, 'probing', bytes=source.stat().st_size)
+    duration = video_duration(source, out_dir)
     LOG.info('Source duration: %.2f seconds', duration)
+    write_progress(out_dir, 'probed', duration_seconds=duration)
     if mode == 'automatic' and duration < min_seconds:
         raise ValueError('Input is shorter than min_seconds. Select precut mode instead.')
     proxy = work_dir / 'analysis.mp4'
+    write_progress(out_dir, 'creating_analysis_proxy', duration_seconds=duration)
     make_analysis_proxy(source, proxy)
+    write_progress(out_dir, 'analysis_proxy_ready', proxy_bytes=proxy.stat().st_size)
     prompt = editorial_prompt(duration, mode=mode, language=language, count=count,
                               min_seconds=min_seconds, max_seconds=max_seconds, subject=subject)
+    write_progress(out_dir, 'generating_gemini_plan', model=model)
     plan, actual_model = gemini_plan(proxy, prompt, model)
+    write_progress(out_dir, 'gemini_plan_ready', candidates=len(plan.clips), model=actual_model)
     clips, rejects = normalize_clips(plan.clips, duration, min_seconds, max_seconds, count, mode)
     if not clips:
         (out_dir / 'rejected.json').write_text(json.dumps(rejects, ensure_ascii=False, indent=2), encoding='utf-8')
@@ -753,6 +832,7 @@ def main() -> None:
     for number, clip in enumerate(clips, start=1):
         vid_path = out_dir / 'clips' / f'clip-{number:02d}.mp4'
         cover_path = out_dir / 'covers' / f'clip-{number:02d}.jpg'
+        write_progress(out_dir, 'rendering', clip=number, total=len(clips))
         LOG.info('Rendering clip %d: %.2f-%.2f', number, clip.start, clip.end)
         render_video(source, vid_path, clip.start, clip.end)
         try:
@@ -782,6 +862,7 @@ def main() -> None:
             f.write(f'### YouTube Clip Studio\n\nCreated **{len(rows)}** clip(s). '
                     f'Output includes `dashboard.html`, MP4 clips and metadata. '
                     f'Download the **youtube-studio** artifact below.\n')
+    write_progress(out_dir, 'completed', clips=len(rows), dashboard='dashboard.html')
     LOG.info('Done: %d clips. Read output/dashboard.html', len(rows))
     # Keep source and proxy off artifacts; no large persistent storage on GitHub.
     shutil.rmtree(work_dir, ignore_errors=True)
@@ -792,6 +873,19 @@ if __name__ == '__main__':
         main()
     except Exception as error:
         logging.exception('Studio failed: %s', error)
+        import traceback
+        output = Path(os.environ.get('OUTPUT_DIR', 'output'))
+        output.mkdir(parents=True, exist_ok=True)
+        (output / 'error-report.txt').write_text('Studio failed:\n' + traceback.format_exc()[-9000:], encoding='utf-8')
+        prior = {}
+        status_path = output / 'run-status.json'
+        if status_path.is_file():
+            try:
+                prior = json.loads(status_path.read_text(encoding='utf-8'))
+            except Exception:
+                pass
+        write_progress(output, 'failed', previous_phase=prior.get('phase', 'unknown'),
+                       error_type=type(error).__name__, error=str(error)[-900:])
         message = str(error).replace('%', '%25').replace('\r', '%0D').replace('\n', '%0A')
         print(f'::error title=YouTube Clip Studio::{message}', flush=True)
         sys.exit(1)
