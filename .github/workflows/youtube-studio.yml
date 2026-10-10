@@ -115,8 +115,23 @@ jobs:
       - name: Self-tests (offline)
         run: python -m unittest discover -s tests -q
 
-      - name: Process source and create clips
-        run: python studio.py
+      - name: Process source and create clips (keep full diagnostic log)
+        shell: bash
+        run: |
+          mkdir -p output
+          set -o pipefail
+          python -u studio.py 2>&1 | tee output/studio-run.log
+
+      - name: Print last execution phase
+        if: always()
+        shell: bash
+        run: |
+          echo '--- Last recorded progress ---'
+          cat output/run-status.json 2>/dev/null || echo 'No status was written'
+          echo '--- Media probe ---'
+          cat output/media-probe.json 2>/dev/null || echo 'No completed probe'
+          echo '--- Error report ---'
+          tail -n 35 output/error-report.txt 2>/dev/null || true
 
       - name: Upload results (including partial results if processing fails)
         if: always()
