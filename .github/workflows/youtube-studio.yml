@@ -1,0 +1,114 @@
+name: YouTube Clip Studio | ساخت کلیپ و بسته انتشار
+
+on:
+  workflow_dispatch:
+    inputs:
+      video_url:
+        description: 'لینک مستقیم ویدئو / Google Drive (Anyone with the link) / YouTube (محتوای مجاز)'
+        required: true
+        type: string
+      mode:
+        description: 'نوع پردازش'
+        required: true
+        default: automatic
+        type: choice
+        options:
+          - automatic
+          - precut
+      language:
+        description: 'زبان خروجی'
+        required: true
+        default: fa
+        type: choice
+        options:
+          - fa
+          - bn
+          - ar
+          - en
+      count:
+        description: 'حداکثر تعداد کلیپ (در حالت automatic)'
+        required: true
+        default: '4'
+        type: choice
+        options:
+          - '1'
+          - '2'
+          - '3'
+          - '4'
+          - '5'
+          - '6'
+      min_seconds:
+        description: 'حداقل طول کلیپ - ثانیه'
+        required: true
+        default: '25'
+        type: string
+      max_seconds:
+        description: 'حداکثر طول کلیپ - ثانیه'
+        required: true
+        default: '65'
+        type: string
+      subject:
+        description: 'موضوع / لحن / کلیدواژه اختیاری؛ مثلا غدیر، گفتگوی علمی، بدون تیتر اغراق‌آمیز'
+        required: false
+        default: ''
+        type: string
+      model:
+        description: 'مدل تحلیل؛ برای هزینه کمتر از Flash-Lite استفاده کنید'
+        required: true
+        default: gemini-3.8-flash
+        type: choice
+        options:
+          - gemini-3.8-flash
+          - gemini-3.5-flash-lite
+
+permissions:
+  contents: read
+
+concurrency:
+  group: youtube-clip-studio
+  cancel-in-progress: false
+
+jobs:
+  clips:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    env:
+      GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+      VIDEO_URL: ${{ inputs.video_url }}
+      STUDIO_MODE: ${{ inputs.mode }}
+      STUDIO_LANGUAGE: ${{ inputs.language }}
+      STUDIO_COUNT: ${{ inputs.count }}
+      STUDIO_MIN_SECONDS: ${{ inputs.min_seconds }}
+      STUDIO_MAX_SECONDS: ${{ inputs.max_seconds }}
+      STUDIO_SUBJECT: ${{ inputs.subject }}
+      STUDIO_MODEL: ${{ inputs.model }}
+      OUTPUT_DIR: output
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: pip
+
+      - name: Install FFmpeg, Persian/Arabic fonts and dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq ffmpeg fonts-noto-core
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt
+
+      - name: Process source and create clips
+        run: python studio.py
+
+      - name: Upload results (including partial results if processing fails)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: youtube-studio-${{ github.run_number }}
+          path: output/
+          if-no-files-found: warn
+          retention-days: 3
+          compression-level: 5
